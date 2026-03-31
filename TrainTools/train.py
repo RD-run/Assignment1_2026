@@ -20,10 +20,22 @@ from Optimizers import optimizers
 from Schedulers import schedulers
 from Tools import set_seed
 from EvaluateTools.eval_utils import run_eval
-from TrainTools.train_utils import train_single_epoch, save_checkpoint
+from TrainTools.train_utils import plot_loss_curves, train_single_epoch, save_checkpoint
 
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _get_runtime_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _build_namespace(config):
+    return argparse.Namespace(**config)
+
+
+def _describe_device(device: torch.device) -> str:
+    if device.type == "cuda":
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        return f"cuda:{idx} ({torch.cuda.get_device_name(idx)})"
+    return str(device)
 
 
 def train(
@@ -99,19 +111,25 @@ def train(
         config    : dict        — full resolved configuration
     """
     set_seed(seed)
+    device = _get_runtime_device()
 
     os.makedirs(log_dir,  exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
+    print(f"Using device: {_describe_device(device)}")
 
     # Internal namespace required by QANet.__init__ and data utilities
-    args = argparse.Namespace({k: v for k, v in locals().items()})
+    config = {
+        k: v for k, v in locals().items()
+        if k not in {"config", "args", "device"}
+    }
+    args = _build_namespace(config)
 
     with open(os.path.join(save_dir, "run_config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
     sanity_check_cache(args)
     word_mat, char_mat   = load_word_char_mats(args)
-    model                = QANet(word_mat, char_mat, args).to(DEVICE)
+    model                = QANet(word_mat, char_mat, args).to(device)
     train_eval, dev_eval = load_train_dev_eval(args)
 
     train_dataset = SQuADDataset(train_npz)
@@ -119,7 +137,7 @@ def train(
 
     train_loader = make_loader(
         train_dataset, batch_size,
-        shuffle=True, pin_memory=(DEVICE.type == "cuda"),
+        shuffle=True, pin_memory=(device.type == "cuda"),
     )
 
     def _infinite(loader):
@@ -147,13 +165,14 @@ def train(
     best_em  = 0.0
     patience = 0
     history  = []
+    loss_plot_path = os.path.join(log_dir, "loss_curve.png")
 
     for step0 in range(0, num_steps, checkpoint):
         steps_this_block = min(checkpoint, num_steps - step0)
 
         train_loss = train_single_epoch(
             model, optimizer, scheduler, _train_iter,
-            steps_this_block, grad_clip, loss_fn, DEVICE,
+            steps_this_block, grad_clip, loss_fn, device,
             global_step=step0,
         )
 
@@ -161,7 +180,7 @@ def train(
             model, train_dataset, train_eval,
             num_batches=val_num_batches, batch_size=batch_size,
             use_random_batches=True,
-            device=DEVICE, loss_fn=loss_fn,
+            device=device, loss_fn=loss_fn,
         )
         print("VALID(train) loss {loss:8f}  F1 {f1:8f}  EM {exact_match:8f}\n".format(**tr_metrics))
 
@@ -169,7 +188,7 @@ def train(
             model, dev_dataset, dev_eval,
             num_batches=test_num_batches, batch_size=batch_size,
             use_random_batches=False,
-            device=DEVICE, loss_fn=loss_fn,
+            device=device, loss_fn=loss_fn,
         )
         print("TEST        loss {loss:8f}  F1 {f1:8f}  EM {exact_match:8f}\n".format(**dv_metrics))
 
@@ -202,11 +221,14 @@ def train(
 
         save_checkpoint(
             save_dir, ckpt_name, model, optimizer, scheduler,
-            step0 + steps_this_block, best_f1, best_em, vars(args),
+            step0 + steps_this_block, best_f1, best_em, config,
         )
 
         with open(os.path.join(log_dir, "answers.json"), "w") as f:
             json.dump(ans, f)
+
+    plot_loss_curves(history, loss_plot_path)
+    print(f"Saved loss curve to: {os.path.abspath(loss_plot_path)}")
 
     print(f"Training finished.  Best F1: {best_f1:.4f}  Best EM: {best_em:.4f}")
 
@@ -214,6 +236,7 @@ def train(
         "best_f1":   best_f1,
         "best_em":   best_em,
         "history":   history,
+        "loss_plot_path": os.path.abspath(loss_plot_path),
         "ckpt_path": os.path.abspath(os.path.join(save_dir, ckpt_name)),
-        "config":    vars(args),
+        "config":    config,
     }

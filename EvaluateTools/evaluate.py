@@ -23,7 +23,15 @@ from Models import QANet
 from EvaluateTools.eval_utils import run_eval
 
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _get_runtime_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _describe_device(device: torch.device) -> str:
+    if device.type == "cuda":
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        return f"cuda:{idx} ({torch.cuda.get_device_name(idx)})"
+    return str(device)
 
 
 def evaluate(
@@ -85,7 +93,9 @@ def evaluate(
     dict
         ``{"f1": float, "exact_match": float, "loss": float}``
     """
+    device = _get_runtime_device()
     os.makedirs(log_dir, exist_ok=True)
+    print(f"Using device: {_describe_device(device)}")
 
     if loss_name not in losses:
         raise ValueError(f"Unknown loss '{loss_name}'. Available: {list(losses.keys())}")
@@ -108,22 +118,30 @@ def evaluate(
         pretrained_char=pretrained_char,
     )
 
+    ckpt_path = os.path.join(save_dir, ckpt_name)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt_config = ckpt.get("config", {})
+    for key in (
+        "para_limit", "ques_limit", "char_limit", "d_model", "num_heads",
+        "glove_dim", "char_dim", "dropout", "dropout_char", "pretrained_char",
+        "activation", "init_name", "norm_name", "norm_groups",
+    ):
+        if key in ckpt_config:
+            setattr(args, key, ckpt_config[key])
+
     word_mat, char_mat = load_word_char_mats(args)
-    model = QANet(word_mat, char_mat, args).to(DEVICE)
+    model = QANet(word_mat, char_mat, args).to(device)
+    model.load_state_dict(ckpt["model_state"])
 
     dev_eval = load_dev_eval(args)
     dev_dataset = SQuADDataset(dev_npz)
-
-    ckpt_path = os.path.join(save_dir, ckpt_name)
-    ckpt = torch.load(ckpt_path, map_location=DEVICE)
-    model.load_state_dict(ckpt["model"])
 
     metrics, ans = run_eval(
         model, dev_dataset, dev_eval,
         num_batches=test_num_batches,
         batch_size=batch_size,
         use_random_batches=False,
-        device=DEVICE,
+        device=device,
         loss_fn=losses[loss_name],
     )
 
